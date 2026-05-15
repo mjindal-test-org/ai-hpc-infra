@@ -1,0 +1,56 @@
+# ── TPU Requirements — Llama 3.1 7B Fine-tuning + Inference ──────────────────
+# Install: pip install -r requirements_tpu.txt
+#
+# Hardware: Google Cloud TPU (v3, v4, v5) via Cloud TPU VM
+# Must run on a TPU VM — torch_xla does not work on regular CPU/GPU machines
+#
+# GCP TPU VMs come with torch_xla pre-installed.
+# If not, install torch + torch_xla together (versions must match exactly):
+#
+#   pip install torch==2.3.0 \
+#       torch_xla[tpu]==2.3.0 \
+#       -f https://storage.googleapis.com/libtpu-releases/index.html
+#
+# Then install everything else:
+#   pip install -r requirements_tpu.txt
+#
+# NOT supported on TPU (do not install):
+#   bitsandbytes  — CUDA-only, no TPU support (no INT4/INT8 quantisation)
+#   vllm          — CUDA-only inference server
+#   flash-attn    — CUDA kernel, no TPU equivalent
+#   nvidia-ml-py  — NVIDIA-specific, meaningless on TPU
+# -----------------------------------------------------------------------------
+
+# ── Core ML framework ─────────────────────────────────────────────────────────
+# torch and torch_xla are installed separately (see header)
+transformers==4.43.0          # HuggingFace model loading, tokeniser, training utils
+accelerate==0.31.0            # Device placement, mixed precision utilities
+datasets==2.20.0              # HuggingFace dataset loading and processing
+
+# ── Fine-tuning (LoRA only — no QLoRA on TPU) ────────────────────────────────
+peft==0.11.1                  # LoRA adapters (rank-16 BF16, not 4-bit quantised)
+                              # bitsandbytes is NOT installed — no INT4 on TPU
+                              # Use full BF16 weights + LoRA adapters instead
+
+# ── Experiment tracking ───────────────────────────────────────────────────────
+wandb==0.17.4                 # Training metrics — same as GPU, works on TPU
+
+# ── Inference serving (TPU) ───────────────────────────────────────────────────
+# vLLM is NOT supported on TPU. Use one of:
+#   1. This FastAPI wrapper (inference_tpu.py) — simple, single-user
+#   2. JetStream — Google's production TPU serving framework
+#      pip install jetstream  (separate install, Google-managed package)
+fastapi==0.111.0              # REST API wrapper for TPU inference
+uvicorn[standard]==0.30.1     # ASGI server to run FastAPI
+pydantic==2.7.4               # Request/response validation
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+numpy==1.26.4
+scipy==1.13.1
+tqdm==4.66.4
+sentencepiece==0.2.0          # Tokeniser backend
+protobuf==5.27.2              # Required by sentencepiece
+safetensors==0.4.3            # Fast model weight loading
+huggingface-hub==0.23.4       # Download models from HuggingFace Hub
+packaging==24.1
+psutil==5.9.8                 # System resource monitoring
