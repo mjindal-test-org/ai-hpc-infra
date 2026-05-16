@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------
 
 # Core — pinned to last versions before transformers 4.40 config lock-down
-transformers==4.39.3          # last version without use_cache lock-down issue
+transformers>=4.40.0          # last version without use_cache lock-down issue
 accelerate==0.29.3            # matches transformers 4.39.x
 datasets==2.18.0
 
