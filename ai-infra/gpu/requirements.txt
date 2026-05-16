@@ -1,59 +1,40 @@
-# ── GPU Requirements — Llama 3.1 7B Fine-tuning + Inference ──────────────────
-# Install: pip install -r requirements_gpu.txt
+# ── GPU requirements — Mistral-7B-v0.3 + ultrachat_200k ──────────────────────
+# Versions pinned to avoid the ValueError breaking change in transformers 4.40+
 #
-# Hardware: NVIDIA GPU (A100, H100, A10G, RTX 3090+)
-# CUDA:     12.1 or 12.2 recommended
-#
-# Install PyTorch FIRST (separately) with the right CUDA version:
-#   pip install torch==2.3.0 torchvision torchaudio \
-#       --index-url https://download.pytorch.org/whl/cu121
-#
-# Then install everything else:
-#   pip install -r requirements_gpu.txt
-#
-# Flash Attention requires a separate install (needs compilation):
-#   pip install flash-attn --no-build-isolation
+# INSTALL ORDER (important):
+#   1. pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121
+#   2. pip install -r requirements_gpu.txt
+#   3. pip install flash-attn --no-build-isolation
 # -----------------------------------------------------------------------------
 
-# ── Core ML framework ─────────────────────────────────────────────────────────
-# torch is installed separately (see header) — version must match CUDA version
-transformers==4.43.0          # HuggingFace model loading, tokeniser, training utils
-accelerate==0.31.0            # multi-GPU training utilities, device placement
-datasets==2.20.0              # HuggingFace dataset loading and processing
+# Core — pinned to last versions before transformers 4.40 config lock-down
+transformers==4.39.3          # last version without use_cache lock-down issue
+accelerate==0.29.3            # matches transformers 4.39.x
+datasets==2.18.0
 
-# ── Fine-tuning (LoRA / QLoRA) ────────────────────────────────────────────────
-peft==0.11.1                  # LoRA, QLoRA, and other parameter-efficient methods
-bitsandbytes==0.43.1          # 4-bit and 8-bit quantisation (QLoRA base model)
-                              # Also provides 8-bit AdamW optimizer
+# Fine-tuning
+peft==0.10.0                  # stable, compatible with transformers 4.39.x
+bitsandbytes==0.43.1          # 4-bit quantisation (QLoRA)
 
-# ── Inference serving ─────────────────────────────────────────────────────────
-vllm==0.5.0                   # Production LLM serving — continuous batching,
-                              # PagedAttention, OpenAI-compatible API
-                              # NOTE: vLLM installs its own torch — pin versions carefully
+# Inference serving
+vllm==0.4.3                   # pinned — newer versions may require torch 2.4+
 
-# ── Attention optimisation ────────────────────────────────────────────────────
-# flash-attn is installed separately — see header comment
-# It requires: gcc, g++, ninja, and matching CUDA toolkit
-einops==0.8.0                 # Required by some model architectures
+# Experiment tracking
+wandb==0.17.4
 
-# ── Experiment tracking ───────────────────────────────────────────────────────
-wandb==0.17.4                 # Training metrics, loss curves, GPU utilization logging
-
-# ── API serving (optional — if wrapping vLLM in FastAPI) ─────────────────────
+# API server (optional)
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 pydantic==2.7.4
-openai==1.35.7                # Client SDK for calling vLLM's OpenAI-compatible API
+openai==1.35.7                # for calling vLLM's OpenAI-compatible API
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
-numpy==1.26.4                 # Array operations
-scipy==1.13.1                 # Scientific computing utilities
-tqdm==4.66.4                  # Progress bars
-sentencepiece==0.2.0          # Tokeniser backend for some models
-protobuf==5.27.2              # Required by sentencepiece
-tiktoken==0.7.0               # OpenAI tokeniser (used by some models)
-safetensors==0.4.3            # Fast, safe model weight loading format
-huggingface-hub==0.23.4       # Download models and datasets from HuggingFace Hub
-packaging==24.1               # Version parsing utility
-psutil==5.9.8                 # System resource monitoring (RAM, CPU)
-nvidia-ml-py==12.555.43       # Python bindings for nvidia-smi (pynvml)
+# Utilities
+numpy==1.26.4
+tqdm==4.66.4
+sentencepiece==0.2.0
+protobuf==5.27.2
+safetensors==0.4.3
+huggingface-hub==0.22.2       # matches transformers 4.39.x
+packaging==24.1
+psutil==5.9.8
+nvidia-ml-py==12.555.43       # pynvml — python bindings for nvidia-smi

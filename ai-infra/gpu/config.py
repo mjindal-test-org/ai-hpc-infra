@@ -1,5 +1,6 @@
 """
-config.py — Configuration for Mistral-7B-v0.3 + ultrachat_200k.
+config.py — Mistral-7B-v0.3 + ultrachat_200k configuration.
+No HuggingFace token required — Mistral is fully open.
 """
 
 from dataclasses import dataclass, field
@@ -8,19 +9,10 @@ from typing import Optional
 
 @dataclass
 class ModelConfig:
-    model_name: str = "mistralai/Mistral-7B-v0.3"
-
-    # Mistral is not gated — no token needed
-    hf_token: Optional[str] = None
-
-    # Fixed sequence length.
-    # On TPU: never change this between runs — XLA recompiles on shape changes.
-    # On GPU: can be dynamic but fixed is also fine.
-    max_seq_len: int = 2048
-
-    # GPU only: quantise base model to 4-bit (QLoRA).
-    # TPU: ignored — bitsandbytes not supported on TPU.
-    use_4bit_quantisation: bool = True
+    model_name: str         = "mistralai/Mistral-7B-v0.3"
+    hf_token: Optional[str] = None      # not needed for Mistral
+    max_seq_len: int        = 2048      # fixed on TPU, flexible on GPU
+    use_4bit_quantisation: bool = True  # GPU only — ignored on TPU
 
     # LoRA — same layer names for Mistral and Llama
     lora_r: int         = 16
@@ -34,13 +26,10 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    dataset_name: str = "HuggingFaceH4/ultrachat_200k"
-    train_split: str  = "train_sft"
-    eval_split: str   = "test_sft"
-
-    # Set to -1 to use full 200K examples.
-    # Use 5000 first to verify the pipeline works end-to-end.
-    max_train_samples: int = 5000
+    dataset_name: str  = "HuggingFaceH4/ultrachat_200k"
+    train_split: str   = "train_sft"
+    eval_split: str    = "test_sft"
+    max_train_samples: int = 5000   # -1 = full 200K
     max_eval_samples: int  = 500
 
     output_dir: str     = "./output"
@@ -49,16 +38,15 @@ class TrainingConfig:
     per_device_batch_size: int       = 2
     gradient_accumulation_steps: int = 8
     num_epochs: int                  = 1
-    max_steps: int                   = -1   # -1 = full epoch
+    max_steps: int                   = -1
 
     learning_rate: float = 2e-4
     weight_decay: float  = 0.01
     warmup_ratio: float  = 0.03
     lr_scheduler: str    = "cosine"
 
-    # BF16 for A100/H100/TPU. Set fp16=True only for older GPUs (V100).
-    bf16: bool = True
-    fp16: bool = False
+    bf16: bool = True   # A100/H100/TPU
+    fp16: bool = False  # V100 only
 
     logging_steps: int    = 10
     save_steps: int       = 500
