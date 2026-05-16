@@ -125,13 +125,18 @@ def train(model_cfg: ModelConfig, train_cfg: TrainingConfig):
         from torch.utils.data.distributed import DistributedSampler
         tr_sampler = DistributedSampler(train_ds, world_size, rank, shuffle=True)
         ev_sampler = DistributedSampler(eval_ds,  world_size, rank, shuffle=False)
-        train_loader = make_dataloader_gpu(train_ds, train_cfg.per_device_batch_size, False)
-        eval_loader  = make_dataloader_gpu(eval_ds,  train_cfg.per_device_batch_size, False)
-        train_loader.sampler = tr_sampler
-        eval_loader.sampler  = ev_sampler
+        # Pass sampler directly into constructor — never set loader.sampler after init
+        # (raises ValueError: sampler attribute should not be set after
+        #  DataLoader is initialized — PyTorch 2.x breaking change)
+        train_loader = make_dataloader_gpu(train_ds, train_cfg.per_device_batch_size,
+                                           sampler=tr_sampler)
+        eval_loader  = make_dataloader_gpu(eval_ds,  train_cfg.per_device_batch_size,
+                                           sampler=ev_sampler)
     else:
+        tr_sampler   = None
         train_loader = make_dataloader_gpu(train_ds, train_cfg.per_device_batch_size)
-        eval_loader  = make_dataloader_gpu(eval_ds,  train_cfg.per_device_batch_size, False)
+        eval_loader  = make_dataloader_gpu(eval_ds,  train_cfg.per_device_batch_size,
+                                           shuffle=False)
 
     # 4. Model — all ValueError fixes in load_model_gpu()
     model = load_model_gpu(
@@ -170,8 +175,8 @@ def train(model_cfg: ModelConfig, train_cfg: TrainingConfig):
 
     for epoch in range(train_cfg.num_epochs):
         model.train()
-        if world_size > 1:
-            train_loader.sampler.set_epoch(epoch)
+        if world_size > 1 and tr_sampler is not None:
+            tr_sampler.set_epoch(epoch)   # reshuffle differently each epoch
         t0 = time.time()
 
         for step, batch in enumerate(train_loader):

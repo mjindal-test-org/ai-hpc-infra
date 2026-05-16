@@ -92,14 +92,25 @@ class UltraChatDataset(Dataset):
 
 
 def make_dataloader_gpu(dataset: UltraChatDataset, batch_size: int,
-                        shuffle: bool = True) -> DataLoader:
-    """Dynamic padding per batch — efficient for GPU."""
+                        shuffle: bool = True,
+                        sampler=None) -> DataLoader:
+    """
+    Dynamic padding per batch — efficient for GPU.
+
+    sampler: pass a DistributedSampler for multi-GPU training.
+             When a sampler is provided, shuffle must be False
+             (the sampler handles shuffling internally).
+    """
     from transformers import DataCollatorForSeq2Seq
     collator = DataCollatorForSeq2Seq(
         dataset.tokenizer, padding=True, pad_to_multiple_of=8,
         return_tensors="pt", label_pad_token_id=-100,
     )
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+    # If a sampler is provided, pass it directly into the constructor.
+    # Never set loader.sampler after init — raises ValueError in PyTorch 2.x.
+    return DataLoader(dataset, batch_size=batch_size,
+                      shuffle=(shuffle if sampler is None else False),
+                      sampler=sampler,          # passed here, not set after
                       collate_fn=collator, num_workers=4,
                       pin_memory=True, drop_last=True)
 
