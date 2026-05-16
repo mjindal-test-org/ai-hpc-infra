@@ -75,16 +75,51 @@ def format_and_tokenize(example: dict, tokenizer, max_seq_len: int) -> dict:
 class UltraChatDataset(Dataset):
     def __init__(self, dataset_name: str, split: str, tokenizer,
                  max_seq_len: int, max_samples: int = -1,
-                 hf_token: Optional[str] = None):
-        print(f"Loading {dataset_name} ({split})...")
+                 hf_token: Optional[str] = None,
+                 rank: int = 0, world_size: int = 1):
+        """
+        rank / world_size are used to avoid all GPUs downloading
+        the dataset simultaneously on first run.
+
+        Strategy:
+          - Rank 0 downloads first and writes to HuggingFace cache
+          - All other ranks wait at a barrier
+          - Then all ranks load from the local cache (fast)
+
+        Without this, 2+ ranks race to download the same file,
+        hit a file lock, and appear to hang indefinitely.
+        """
+        is_main = (rank == 0)
+
+        if is_main:
+            print(f"Rank 0: downloading/loading {dataset_name} ({split})...")
+
+        # Only rank 0 downloads on first run.
+        # Other ranks wait here until rank 0 finishes writing the cache.
+        if world_size > 1:
+            import torch.distributed as dist
+            if not is_main:
+                # Wait for rank 0 to finish downloading
+                dist.barrier()
+
         ds = load_dataset(dataset_name, split=split, token=hf_token)
+
+        if world_size > 1:
+            if is_main:
+                # Signal all other ranks that download is complete
+                dist.barrier()
+
         if max_samples > 0:
             ds = ds.select(range(min(max_samples, len(ds))))
+
         ds = ds.filter(lambda x: len(x["messages"]) >= 2)
+
         self.data        = ds
         self.tokenizer   = tokenizer
         self.max_seq_len = max_seq_len
-        print(f"  {len(self.data):,} examples ready.")
+
+        if is_main:
+            print(f"  {len(self.data):,} examples ready.")
 
     def __len__(self):  return len(self.data)
     def __getitem__(self, idx):

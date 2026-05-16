@@ -150,13 +150,15 @@ def train(model_cfg: ModelConfig, train_cfg: TrainingConfig):
     # 2. Tokeniser
     tokenizer = make_tokenizer(model_cfg.model_name, model_cfg.hf_token)
 
-    # 3. Datasets
+    # 3. Datasets — rank 0 downloads first, others wait (avoids download race)
     train_ds = UltraChatDataset(
         train_cfg.dataset_name, train_cfg.train_split,
-        tokenizer, model_cfg.max_seq_len, train_cfg.max_train_samples)
+        tokenizer, model_cfg.max_seq_len, train_cfg.max_train_samples,
+        rank=rank, world_size=world_size)
     eval_ds = UltraChatDataset(
         train_cfg.dataset_name, train_cfg.eval_split,
-        tokenizer, model_cfg.max_seq_len, train_cfg.max_eval_samples)
+        tokenizer, model_cfg.max_seq_len, train_cfg.max_eval_samples,
+        rank=rank, world_size=world_size)
 
     if world_size > 1:
         from torch.utils.data.distributed import DistributedSampler
@@ -185,10 +187,12 @@ def train(model_cfg: ModelConfig, train_cfg: TrainingConfig):
         use_4bit=model_cfg.use_4bit_quantisation,
         hf_token=model_cfg.hf_token,
         world_size=world_size,
-        local_rank=local_rank,       # needed for device_map={"": local_rank}
+        local_rank=local_rank,
     )
+    log.info(f"Rank {rank}: model loaded — waiting for all ranks at DDP barrier...")
     model = wrap_model(model, local_rank, world_size,
                        use_4bit=model_cfg.use_4bit_quantisation)
+    log.info(f"Rank {rank}: DDP/FSDP wrap complete — starting training")
 
     # 5. Optimiser
     trainable = [p for p in model.parameters() if p.requires_grad]
