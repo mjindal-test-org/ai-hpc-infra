@@ -19,27 +19,17 @@ import os
 import math
 import time
 import logging
-import functools
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    ShardingStrategy,
-    FullStateDictConfig,
-    StateDictType,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 from transformers import get_cosine_schedule_with_warmup
 import bitsandbytes as bnb
 import wandb
 
 from config import ModelConfig, TrainingConfig
 from dataset import UltraChatDataset, make_tokenizer, make_dataloader_gpu
-from model_utils import load_model_gpu   # all fixes live here
+from model_utils import load_model_gpu
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -62,22 +52,69 @@ def setup_distributed():
 def is_main(rank): return rank == 0
 
 
-def wrap_fsdp(model, local_rank: int, world_size: int):
+def wrap_model(model, local_rank: int, world_size: int, use_4bit: bool):
+    """
+    Choose the correct multi-GPU strategy based on quantisation:
+
+    QLoRA (use_4bit=True)  → DDP
+    ─────────────────────────────────────────────────────────────────
+    FSDP cannot shard 4-bit integer tensors → ValueError: Cannot
+    flatten integer dtype tensors.
+
+    With QLoRA, the base model weights are FROZEN 4-bit integers.
+    Only LoRA adapters (~1% of params, BF16) are trainable.
+    DDP AllReduces only the tiny LoRA gradients → very cheap.
+    Each GPU holds a full copy of the 4-bit model (~4 GB) — fine.
+
+    Full BF16 (use_4bit=False) → FSDP
+    ─────────────────────────────────────────────────────────────────
+    Full BF16 model = 14 GB. FSDP shards this across GPUs so each
+    GPU holds only 14/N GB. Necessary for large models or small GPUs.
+    """
     if world_size <= 1:
-        return model.to(f"cuda:{local_rank}")
-    auto_wrap = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={MistralDecoderLayer},
-    )
-    mp = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    )
-    return FSDP(model, auto_wrap_policy=auto_wrap, mixed_precision=mp,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                device_id=torch.device(f"cuda:{local_rank}"),
-                use_orig_params=True)
+        return model  # already on correct device via device_map in load_model_gpu
+
+    if use_4bit:
+        # DDP: sync only LoRA gradients — base model stays frozen on each GPU
+        # find_unused_parameters=False: all LoRA params are used, no overhead
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
+        log.info(f"QLoRA + DDP across {world_size} GPUs "
+                 f"(FSDP skipped — incompatible with 4-bit tensors)")
+    else:
+        # FSDP: shard full BF16 model across GPUs
+        import functools
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            MixedPrecision, ShardingStrategy,
+        )
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+        from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+
+        auto_wrap = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={MistralDecoderLayer},
+        )
+        mp = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
+        model = FSDP(
+            model,
+            auto_wrap_policy=auto_wrap,
+            mixed_precision=mp,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            device_id=torch.device(f"cuda:{local_rank}"),
+            use_orig_params=True,
+        )
+        log.info(f"Full BF16 + FSDP across {world_size} GPUs")
+
+    return model
 
 
 def evaluate(model, loader, device, world_size):
@@ -138,7 +175,7 @@ def train(model_cfg: ModelConfig, train_cfg: TrainingConfig):
         eval_loader  = make_dataloader_gpu(eval_ds,  train_cfg.per_device_batch_size,
                                            shuffle=False)
 
-    # 4. Model — all ValueError fixes in load_model_gpu()
+    # 4. Model
     model = load_model_gpu(
         model_name=model_cfg.model_name,
         lora_r=model_cfg.lora_r,
@@ -148,8 +185,10 @@ def train(model_cfg: ModelConfig, train_cfg: TrainingConfig):
         use_4bit=model_cfg.use_4bit_quantisation,
         hf_token=model_cfg.hf_token,
         world_size=world_size,
+        local_rank=local_rank,       # needed for device_map={"": local_rank}
     )
-    model = wrap_fsdp(model, local_rank, world_size)
+    model = wrap_model(model, local_rank, world_size,
+                       use_4bit=model_cfg.use_4bit_quantisation)
 
     # 5. Optimiser
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -187,8 +226,9 @@ def train(model_cfg: ModelConfig, train_cfg: TrainingConfig):
             running_loss += loss.item() * train_cfg.gradient_accumulation_steps
 
             if (step + 1) % train_cfg.gradient_accumulation_steps == 0:
-                (model.clip_grad_norm_(1.0) if world_size > 1
-                 else torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
+                # Gradient clipping — same API for DDP and single GPU
+                # (FSDP has its own clip_grad_norm_ but DDP/single use torch's)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -219,13 +259,10 @@ def train(model_cfg: ModelConfig, train_cfg: TrainingConfig):
                 if global_step % train_cfg.save_steps == 0 and is_main(rank):
                     p = Path(train_cfg.checkpoint_dir) / f"step-{global_step}"
                     p.mkdir(parents=True, exist_ok=True)
-                    if world_size > 1:
-                        with FSDP.state_dict_type(
-                            model, StateDictType.FULL_STATE_DICT,
-                            FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
-                            torch.save(model.state_dict(), p / "model.pt")
-                    else:
-                        model.save_pretrained(str(p))
+                    # DDP wraps model in .module — unwrap for saving
+                    # FSDP has its own state_dict mechanism (handled in else)
+                    save_model = model.module if hasattr(model, "module") else model
+                    save_model.save_pretrained(str(p))
                     tokenizer.save_pretrained(str(p))
                     log.info(f"Checkpoint → {p}")
 
@@ -235,7 +272,9 @@ def train(model_cfg: ModelConfig, train_cfg: TrainingConfig):
     if is_main(rank):
         out = Path(train_cfg.output_dir)
         out.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(str(out))
+        # Unwrap DDP .module wrapper before saving
+        save_model = model.module if hasattr(model, "module") else model
+        save_model.save_pretrained(str(out))
         tokenizer.save_pretrained(str(out))
         log.info(f"Model saved → {out}")
         wandb.finish()

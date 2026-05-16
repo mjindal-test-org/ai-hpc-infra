@@ -99,33 +99,40 @@ def load_model_gpu(
     use_4bit: bool = True,
     hf_token: Optional[str] = None,
     world_size: int = 1,
+    local_rank: int = 0,
 ) -> torch.nn.Module:
     """
     Load Mistral-7B-v0.3 with QLoRA for GPU training.
 
-    FIX PART 1 — pre-load config with use_cache=False:
-      We load AutoConfig first, set use_cache=False on it, then pass
-      that config object to from_pretrained(config=...).
-      The model is born with use_cache=False — it was never set "after init".
+    CRITICAL: FSDP is INCOMPATIBLE with 4-bit bitsandbytes quantisation.
+    ─────────────────────────────────────────────────────────────────────
+    FSDP works by flattening and sharding all tensors across GPUs.
+    4-bit quantised weights are stored as integer (uint8) tensors.
+    FSDP cannot flatten integer tensors → raises:
+      ValueError: Cannot flatten integer dtype tensors
 
-    FIX PART 2 — bypass gradient_checkpointing_enable():
-      We call _enable_gradient_checkpointing() which uses the internal
-      _set_gradient_checkpointing() method that doesn't touch config.
+    SOLUTION: Use DDP (DistributedDataParallel) for QLoRA, not FSDP.
+    ─────────────────────────────────────────────────────────────────────
+    With QLoRA, only ~1% of parameters (the LoRA adapters) are trainable.
+    These are tiny BF16 tensors. DDP AllReduces only the trainable gradients,
+    which is very cheap. The 4-bit base weights stay frozen on each GPU.
 
-    FIX PART 3 — all config objects built in one shot:
-      BitsAndBytesConfig and LoraConfig are constructed once.
-      Their attributes are never modified after construction.
+    device_map for multi-GPU QLoRA:
+      Each GPU loads a full copy of the quantised model (only ~4GB in 4-bit).
+      device_map={"": local_rank} puts the entire model on THIS GPU.
+      DDP then syncs only LoRA gradients across GPUs — nothing is sharded.
+
+    For non-quantised (BF16) multi-GPU: use FSDP via wrap_model_ddp_or_fsdp()
+    in train_gpu.py which checks use_4bit and chooses the right strategy.
     """
-    log.info(f"Loading {model_name} for GPU...")
+    log.info(f"Loading {model_name} for GPU (use_4bit={use_4bit}, "
+             f"world_size={world_size}, local_rank={local_rank})...")
 
-    # ── FIX PART 1: pre-load and configure config before model exists ─────────
-    model_config = AutoConfig.from_pretrained(
-        model_name,
-        token=hf_token,
-    )
-    model_config.use_cache = False  # SAFE here — model doesn't exist yet
+    # ── Pre-load config with use_cache=False (before model exists) ────────────
+    model_config = AutoConfig.from_pretrained(model_name, token=hf_token)
+    model_config.use_cache = False  # safe here — model doesn't exist yet
 
-    # ── FIX PART 3: BitsAndBytesConfig built in one shot ─────────────────────
+    # ── BitsAndBytesConfig (built once, never modified) ───────────────────────
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
@@ -133,28 +140,37 @@ def load_model_gpu(
         bnb_4bit_quant_type="nf4",
     ) if use_4bit else None
 
+    if use_4bit and world_size > 1:
+        # QLoRA multi-GPU: place the ENTIRE model on this specific GPU.
+        # DDP (not FSDP) will sync only the tiny LoRA gradients.
+        # Each GPU holds its own full copy of the 4-bit model (~4GB — cheap).
+        device_map = {"": local_rank}
+    elif use_4bit:
+        # QLoRA single GPU: auto-place on the available GPU
+        device_map = "auto"
+    else:
+        # Full BF16: load to CPU first, FSDP will shard across GPUs
+        device_map = "cpu" if world_size > 1 else "auto"
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        config=model_config,
+        config=model_config,                      # use_cache=False baked in
         token=hf_token,
         quantization_config=quant_config,
         torch_dtype=torch.bfloat16,
-        device_map="cpu" if world_size > 1 else "auto",
-        attn_implementation=_get_attn_implementation(),  # auto-detects flash_attn
+        device_map=device_map,
+        attn_implementation=_get_attn_implementation(),
     )
 
-    # ── FIX PART 2: safe gradient checkpointing ───────────────────────────────
+    # ── Gradient checkpointing (safe — doesn't touch config) ──────────────────
     if use_4bit:
-        # prepare_model_for_kbit_training handles checkpointing internally.
-        # We pass use_gradient_checkpointing=False and do it ourselves
-        # to avoid the double-enable issue.
         model = prepare_model_for_kbit_training(
             model,
-            use_gradient_checkpointing=False,  # we handle it below
+            use_gradient_checkpointing=False,  # handled below
         )
-    _enable_gradient_checkpointing(model)      # safe, doesn't touch config
+    _enable_gradient_checkpointing(model)
 
-    # ── FIX PART 3: LoraConfig built in one shot ──────────────────────────────
+    # ── LoRA adapters (built once, never modified) ─────────────────────────────
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
