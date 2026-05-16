@@ -73,6 +73,23 @@ def _enable_gradient_checkpointing(model: torch.nn.Module) -> None:
             raise  # re-raise anything unrelated
 
 
+def _get_attn_implementation() -> str:
+    """
+    Return the best available attention implementation.
+    Uses FlashAttention 2 if installed, otherwise falls back to
+    the default scaled dot-product attention (still fast on A100/H100
+    via PyTorch 2.x's built-in SDPA).
+    """
+    try:
+        import flash_attn  # noqa: F401
+        log.info("FlashAttention 2 available — using it")
+        return "flash_attention_2"
+    except ImportError:
+        log.info("flash_attn not installed — using default SDPA attention. "
+                 "To install: pip install flash-attn --no-build-isolation")
+        return "sdpa"   # PyTorch 2.x built-in — still fast, no install needed
+
+
 def load_model_gpu(
     model_name: str,
     lora_r: int,
@@ -118,14 +135,12 @@ def load_model_gpu(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        config=model_config,            # ← pre-configured: use_cache already False
+        config=model_config,
         token=hf_token,
         quantization_config=quant_config,
         torch_dtype=torch.bfloat16,
         device_map="cpu" if world_size > 1 else "auto",
-        attn_implementation="flash_attention_2",
-        # DO NOT pass use_cache=False here — it's already in model_config
-        # Passing it here AND having it in config causes a double-set in some versions
+        attn_implementation=_get_attn_implementation(),  # auto-detects flash_attn
     )
 
     # ── FIX PART 2: safe gradient checkpointing ───────────────────────────────

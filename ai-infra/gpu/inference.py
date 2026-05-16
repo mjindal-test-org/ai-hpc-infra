@@ -19,6 +19,15 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
+def _get_attn_implementation() -> str:
+    """Auto-detect best attention: FlashAttention 2 if installed, else SDPA."""
+    try:
+        import flash_attn  # noqa: F401
+        return "flash_attention_2"
+    except ImportError:
+        return "sdpa"   # PyTorch 2.x built-in — still fast, no extra install
+
+
 def run_single(model_path: str, message: str):
     print(f"Loading {model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -30,8 +39,7 @@ def run_single(model_path: str, message: str):
         model_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        attn_implementation="flash_attention_2",
-        # use_cache defaults True for inference — do NOT set it here or after
+        attn_implementation=_get_attn_implementation(),
     )
     model.eval()
 
