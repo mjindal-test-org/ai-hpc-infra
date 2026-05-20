@@ -1,0 +1,208 @@
+# =============================================================================
+# tpu/training_job.yaml — Kubernetes Job for TPU v4-8 training
+#
+# Key differences from GPU job:
+#   - Uses TPU node pool (toleration: google.com/tpu)
+#   - Requests google.com/tpu resource (not nvidia.com/gpu)
+#   - Uses torch_xla instead of torchrun
+#   - 1 pod runs on the TPU host machine and fans out to all 8 chips via xmp.spawn
+#   - GCS mounted for model checkpoints (same as GPU)
+#
+# Apply:  kubectl apply -f tpu/training_job.yaml
+# Watch:  kubectl logs -f job/mistral-tpu-training -c trainer
+# Delete: kubectl delete -f tpu/training_job.yaml
+# =============================================================================
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mistral-tpu-training
+  namespace: default
+  labels:
+    app: mistral-training
+    hardware: tpu
+    model: mistral-7b
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3
+
+  template:
+    metadata:
+      labels:
+        app: mistral-training
+        hardware: tpu
+        job-name: mistral-tpu-training
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8080"
+    spec:
+      # ── Scheduling: place only on TPU nodes ────────────────────────────────
+      nodeSelector:
+        pool-type: tpu
+        tpu-type: v4-8
+      tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      restartPolicy: OnFailure
+
+      # ── Init container: install dependencies ───────────────────────────────
+      initContainers:
+        - name: setup
+          image: python:3.11-slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "=== Installing TPU dependencies ==="
+              pip install --quiet \
+                torch==2.3.0 \
+                torch_xla[tpu]==2.3.0 \
+                -f https://storage.googleapis.com/libtpu-releases/index.html
+
+              pip install --quiet \
+                transformers==4.39.3 \
+                peft==0.10.0 \
+                accelerate==0.29.3 \
+                datasets==2.18.0 \
+                google-cloud-monitoring==2.19.3
+
+              echo "=== Copying code from GCS ==="
+              gsutil -m cp gs://${GCS_BUCKET}/code/*.py /workspace/
+              echo "=== TPU setup complete ==="
+          env:
+            - name: GCS_BUCKET
+              value: "$(PROJECT_ID)-mistral-training"
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+
+      # ── Main training container ─────────────────────────────────────────────
+      containers:
+        - name: trainer
+          # Google's official TPU VM image — has libtpu pre-installed
+          image: us-docker.pkg.dev/cloud-tpu-images/release/tpu-pytorch-2.3:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              JOB_START=$(date +%s)
+              echo "TPU training job started at: $(date -u)"
+
+              # ── Verify TPU is available ────────────────────────────────────
+              python3 -c "
+              import torch_xla.core.xla_model as xm
+              print('TPU device:', xm.xla_device())
+              print('Num chips:', xm.xrt_world_size())
+              "
+
+              # ── Mount GCS ─────────────────────────────────────────────────
+              mkdir -p /gcs
+              gcsfuse --implicit-dirs ${GCS_BUCKET} /gcs
+
+              mkdir -p /gcs/output /gcs/checkpoints /gcs/.cache/huggingface
+
+              # ── Start TPU metrics exporter ─────────────────────────────────
+              python /workspace/monitoring/tpu_metrics_exporter.py \
+                --port 8080 &
+              EXPORTER_PID=$!
+
+              # ── Run training (xmp.spawn handles multi-chip internally) ──────
+              echo "Launching TPU training (8 chips via xmp.spawn)..."
+              python /workspace/train_tpu.py
+
+              TRAINING_EXIT=$?
+
+              # ── Cost calculation ───────────────────────────────────────────
+              JOB_END=$(date +%s)
+              WALL_TIME_SEC=$((JOB_END - JOB_START))
+              WALL_TIME_MIN=$(echo "scale=2; ${WALL_TIME_SEC}/60" | bc)
+              WALL_TIME_HR=$(echo "scale=4; ${WALL_TIME_SEC}/3600" | bc)
+
+              # TPU v4 pricing: $3.22 per chip per hour
+              TPU_CHIPS=8
+              TPU_PRICE_PER_CHIP_HR=3.22
+              TOTAL_COST=$(echo "scale=4; ${WALL_TIME_HR} * ${TPU_PRICE_PER_CHIP_HR} * ${TPU_CHIPS}" | bc)
+
+              echo ""
+              echo "================================================"
+              echo "TPU TRAINING COMPLETE"
+              echo "================================================"
+              echo "Wall time:         ${WALL_TIME_MIN} minutes"
+              echo "Wall time (hours): ${WALL_TIME_HR} hours"
+              echo "TPU chips used:    ${TPU_CHIPS} × v4"
+              echo "Price per chip/hr: \$${TPU_PRICE_PER_CHIP_HR}"
+              echo "Estimated cost:    \$${TOTAL_COST}"
+              echo "================================================"
+
+              # ── Write cost report to GCS ───────────────────────────────────
+              cat > /tmp/cost_report.json << EOF
+              {
+                "job_name": "mistral-tpu-training",
+                "hardware": "tpu",
+                "tpu_type": "v4-8",
+                "num_chips": ${TPU_CHIPS},
+                "start_time": "${JOB_START}",
+                "end_time": "${JOB_END}",
+                "wall_time_sec": ${WALL_TIME_SEC},
+                "wall_time_min": ${WALL_TIME_MIN},
+                "price_per_chip_hr": ${TPU_PRICE_PER_CHIP_HR},
+                "estimated_cost_usd": ${TOTAL_COST},
+                "model": "mistralai/Mistral-7B-v0.3",
+                "dataset": "ultrachat_200k",
+                "exit_code": ${TRAINING_EXIT}
+              }
+              EOF
+
+              gsutil cp /tmp/cost_report.json \
+                gs://${GCS_BUCKET}/reports/tpu_cost_$(date +%Y%m%d_%H%M%S).json
+
+              kill ${EXPORTER_PID} 2>/dev/null || true
+              exit ${TRAINING_EXIT}
+
+          env:
+            - name: GCS_BUCKET
+              value: "$(PROJECT_ID)-mistral-training"
+            - name: HF_HOME
+              value: "/gcs/.cache/huggingface"
+            - name: PJRT_DEVICE
+              value: "TPU"              # tell torch_xla to use TPU
+            - name: XRT_TPU_CONFIG
+              value: "localservice;0;localhost:51011"
+            - name: TPU_NUM_DEVICES
+              value: "8"               # v4-8 has 8 chips
+
+          resources:
+            requests:
+              cpu: "24"               # TPU host machines have many CPUs
+              memory: "200Gi"
+              google.com/tpu: "8"     # request all 8 chips on the v4-8
+            limits:
+              cpu: "48"
+              memory: "340Gi"
+              google.com/tpu: "8"
+
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: gcs-fuse-csi
+              mountPath: /gcs
+
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: gcs-fuse-csi
+          csi:
+            driver: gcsfuse.csi.storage.gke.io
+            volumeAttributes:
+              bucketName: "$(PROJECT_ID)-mistral-training"
+              mountOptions: "implicit-dirs"
+
+      serviceAccountName: training-sa

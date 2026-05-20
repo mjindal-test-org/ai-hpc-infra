@@ -1,0 +1,307 @@
+# =============================================================================
+# gpu/training_job.yaml — Kubernetes Job for GPU training
+#
+# What this runs:
+#   - PyTorch distributed training via torchrun
+#   - 2 replicas (pods) × 1 A100 80GB each = 2 GPUs total
+#   - DDP (DistributedDataParallel) for QLoRA multi-GPU sync
+#   - Logs training time, cost, tokens/sec to Cloud Monitoring
+#
+# Apply:  kubectl apply -f gpu/training_job.yaml
+# Watch:  kubectl logs -f job/mistral-gpu-training -c trainer
+# Delete: kubectl delete -f gpu/training_job.yaml
+# =============================================================================
+
+---
+# ── ConfigMap: training hyperparameters ───────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: training-config
+  namespace: default
+data:
+  MODEL_NAME:              "mistralai/Mistral-7B-v0.3"
+  DATASET_NAME:            "HuggingFaceH4/ultrachat_200k"
+  MAX_SEQ_LEN:             "2048"
+  PER_DEVICE_BATCH_SIZE:   "2"
+  GRADIENT_ACCUM_STEPS:    "8"
+  NUM_EPOCHS:              "1"
+  MAX_TRAIN_SAMPLES:       "5000"    # set to -1 for full 200K
+  LEARNING_RATE:           "2e-4"
+  OUTPUT_DIR:              "/gcs/output"
+  CHECKPOINT_DIR:          "/gcs/checkpoints"
+  HF_HOME:                 "/gcs/.cache/huggingface"   # cache on GCS = shared
+  WANDB_MODE:              "disabled"                  # use Cloud Monitoring instead
+
+---
+# ── Service: headless service for pod-to-pod discovery (DDP requires this) ───
+apiVersion: v1
+kind: Service
+metadata:
+  name: mistral-gpu-training-svc
+  namespace: default
+spec:
+  clusterIP: None           # headless — pods discover each other by hostname
+  selector:
+    job-name: mistral-gpu-training
+  ports:
+    - name: nccl
+      port: 29500
+      targetPort: 29500
+
+---
+# ── Job: the actual training job ──────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mistral-gpu-training
+  namespace: default
+  labels:
+    app: mistral-training
+    hardware: gpu
+    model: mistral-7b
+spec:
+  # completions × parallelism = total pods
+  # For DDP: completions=1 job, parallelism=N GPUs
+  completions: 1
+  parallelism: 1
+
+  # Number of times to retry on failure (e.g. spot VM preemption)
+  backoffLimit: 3
+
+  template:
+    metadata:
+      labels:
+        app: mistral-training
+        hardware: gpu
+        job-name: mistral-gpu-training
+      annotations:
+        # Cloud Monitoring scrape annotation — exposes /metrics endpoint
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8080"
+        prometheus.io/path:   "/metrics"
+    spec:
+      # ── Scheduling: place only on GPU nodes ────────────────────────────────
+      nodeSelector:
+        pool-type: gpu
+        accelerator: a100
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      # ── Restart policy: retry on node failure (spot preemption) ────────────
+      restartPolicy: OnFailure
+
+      # ── Init container: install Python deps and verify GPU ─────────────────
+      initContainers:
+        - name: setup
+          image: nvcr.io/nvidia/pytorch:23.12-py3   # NVIDIA official PyTorch image
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "=== GPU Verification ==="
+              nvidia-smi
+              nvidia-smi --query-gpu=name,memory.total,driver_version \
+                --format=csv,noheader
+
+              echo "=== Installing dependencies ==="
+              pip install --quiet \
+                transformers==4.39.3 \
+                peft==0.10.0 \
+                bitsandbytes==0.43.1 \
+                accelerate==0.29.3 \
+                datasets==2.18.0 \
+                bitsandbytes==0.43.1 \
+                google-cloud-monitoring==2.19.3
+
+              echo "=== Copying training code from GCS ==="
+              gsutil -m cp gs://${GCS_BUCKET}/code/*.py /workspace/
+
+              echo "=== Setup complete ==="
+          env:
+            - name: GCS_BUCKET
+              value: "$(PROJECT_ID)-mistral-training"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+
+      # ── Main training container ─────────────────────────────────────────────
+      containers:
+        - name: trainer
+          image: nvcr.io/nvidia/pytorch:23.12-py3
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              # ── Record job start time for cost calculation ──────────────────
+              JOB_START=$(date +%s)
+              echo "Job started at: $(date -u)"
+              echo "GPU info:"
+              nvidia-smi --query-gpu=name,memory.total,power.limit \
+                --format=csv,noheader
+
+              # ── Mount GCS bucket via GCSFuse ───────────────────────────────
+              mkdir -p /gcs
+              gcsfuse --implicit-dirs ${GCS_BUCKET} /gcs
+              echo "GCS bucket mounted at /gcs"
+
+              # ── Set up output directories ──────────────────────────────────
+              mkdir -p /gcs/output /gcs/checkpoints /gcs/.cache/huggingface
+
+              # ── Launch distributed training ────────────────────────────────
+              # NUM_GPUS_PER_NODE is injected by the GPU device plugin
+              NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+              echo "Launching torchrun with ${NUM_GPUS} GPU(s)..."
+
+              # Start GPU metrics exporter in background (for Cloud Monitoring)
+              python /workspace/monitoring/gpu_metrics_exporter.py \
+                --port 8080 &
+              EXPORTER_PID=$!
+
+              # Run training
+              torchrun \
+                --nproc_per_node=${NUM_GPUS} \
+                --master_addr=localhost \
+                --master_port=29500 \
+                /workspace/train_gpu.py
+
+              TRAINING_EXIT=$?
+
+              # ── Calculate wall time and estimated cost ─────────────────────
+              JOB_END=$(date +%s)
+              WALL_TIME_SEC=$((JOB_END - JOB_START))
+              WALL_TIME_MIN=$(echo "scale=2; ${WALL_TIME_SEC}/60" | bc)
+              WALL_TIME_HR=$(echo "scale=4; ${WALL_TIME_SEC}/3600" | bc)
+
+              # A100 80GB on-demand price in us-central1
+              GPU_PRICE_PER_HR=4.26   # USD per A100 per hour
+              NUM_GPUS_COST=${NUM_GPUS}
+              TOTAL_COST=$(echo "scale=4; ${WALL_TIME_HR} * ${GPU_PRICE_PER_HR} * ${NUM_GPUS_COST}" | bc)
+
+              echo ""
+              echo "================================================"
+              echo "TRAINING COMPLETE"
+              echo "================================================"
+              echo "Wall time:         ${WALL_TIME_MIN} minutes"
+              echo "Wall time (hours): ${WALL_TIME_HR} hours"
+              echo "GPUs used:         ${NUM_GPUS_COST} × A100 80GB"
+              echo "GPU price:         \$${GPU_PRICE_PER_HR}/hr per GPU"
+              echo "Estimated cost:    \$${TOTAL_COST}"
+              echo "================================================"
+              echo ""
+
+              # ── Write cost report to GCS ───────────────────────────────────
+              cat > /tmp/cost_report.json << EOF
+              {
+                "job_name": "mistral-gpu-training",
+                "hardware": "gpu",
+                "gpu_type": "A100-80GB",
+                "num_gpus": ${NUM_GPUS_COST},
+                "start_time": "${JOB_START}",
+                "end_time": "${JOB_END}",
+                "wall_time_sec": ${WALL_TIME_SEC},
+                "wall_time_min": ${WALL_TIME_MIN},
+                "price_per_gpu_hr": ${GPU_PRICE_PER_HR},
+                "estimated_cost_usd": ${TOTAL_COST},
+                "model": "mistralai/Mistral-7B-v0.3",
+                "dataset": "ultrachat_200k",
+                "exit_code": ${TRAINING_EXIT}
+              }
+              EOF
+
+              gsutil cp /tmp/cost_report.json \
+                gs://${GCS_BUCKET}/reports/gpu_cost_$(date +%Y%m%d_%H%M%S).json
+
+              echo "Cost report saved to GCS"
+
+              # Stop metrics exporter
+              kill ${EXPORTER_PID} 2>/dev/null || true
+
+              exit ${TRAINING_EXIT}
+
+          env:
+            - name: GCS_BUCKET
+              value: "$(PROJECT_ID)-mistral-training"
+            - name: PROJECT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Training hyperparameters from ConfigMap
+            - name: MODEL_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: training-config
+                  key: MODEL_NAME
+            - name: DATASET_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: training-config
+                  key: DATASET_NAME
+            - name: MAX_TRAIN_SAMPLES
+              valueFrom:
+                configMapKeyRef:
+                  name: training-config
+                  key: MAX_TRAIN_SAMPLES
+            - name: HF_HOME
+              valueFrom:
+                configMapKeyRef:
+                  name: training-config
+                  key: HF_HOME
+            # NCCL tuning for GKE networking
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth0"
+            - name: NCCL_IB_DISABLE
+              value: "1"              # disable InfiniBand (GKE uses VPC networking)
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+
+          resources:
+            requests:
+              cpu: "8"
+              memory: "64Gi"
+              nvidia.com/gpu: "1"     # request 1 A100
+            limits:
+              cpu: "16"
+              memory: "96Gi"
+              nvidia.com/gpu: "1"
+
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: shm                # shared memory for NCCL
+              mountPath: /dev/shm
+            - name: gcs-fuse-csi      # GCSFuse for GCS access
+              mountPath: /gcs
+
+          # Liveness probe — restart pod if training hangs for 30 min
+          livenessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/training_alive"]
+            initialDelaySeconds: 300  # 5 min startup
+            periodSeconds: 60
+            failureThreshold: 30      # 30 min hang threshold
+
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"         # NCCL needs large shared memory
+        - name: gcs-fuse-csi
+          csi:
+            driver: gcsfuse.csi.storage.gke.io
+            volumeAttributes:
+              bucketName: "$(PROJECT_ID)-mistral-training"
+              mountOptions: "implicit-dirs,uid=0,gid=0"
+
+      # ── Service account with GCS and Monitoring access ─────────────────────
+      serviceAccountName: training-sa

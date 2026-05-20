@@ -1,0 +1,49 @@
+# =============================================================================
+# cluster/rbac.yaml — Service accounts and RBAC for training jobs
+#
+# The training-sa service account needs:
+#   - GCS read/write (for model checkpoints and dataset cache)
+#   - Cloud Monitoring write (for custom metrics)
+#   - Workload Identity binding (secure GCP auth from within pods)
+#
+# Apply: kubectl apply -f cluster/rbac.yaml
+# Then:  ./cluster/02_bind_service_account.sh
+# =============================================================================
+
+---
+# ── Kubernetes Service Account ─────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: training-sa
+  namespace: default
+  annotations:
+    # Workload Identity: link this KSA to a GCP service account
+    # This lets pods authenticate to GCP APIs without key files
+    iam.gke.io/gcp-service-account: "training-sa@$(PROJECT_ID).iam.gserviceaccount.com"
+
+---
+# ── ClusterRole: read nodes (for GPU info in monitoring) ──────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: training-node-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ── Bind ClusterRole to service account ───────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: training-node-reader-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: training-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: training-sa
+    namespace: default
